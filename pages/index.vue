@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { DeviceKind, DiffLine, LanguageDraft, ScriptStatus, Segment } from '~/types'
+import type { DeviceKind, DiffLine, LanguageDraft, RehearsalEntry, ScriptStatus, Segment } from '~/types'
 import { LANGUAGES, useScriptStore } from '~/stores/script'
 
 const store = useScriptStore()
@@ -12,6 +12,19 @@ const compareA = ref('')
 const compareB = ref('')
 const helpDialog = ref(false)
 const deleteTarget = ref<string | null>(null)
+const expandedHistory = ref<string[]>([])
+
+const REHEARSAL_LIMIT = 1.1
+
+interface RehearsalRow {
+  segment: Segment
+  index: number
+  planned: number | null
+  actual: number | null
+  diff: number | null
+  cumulative: number | null
+  status: 'measured' | 'stale' | 'pending'
+}
 
 const statusOptions: Array<{ value: ScriptStatus; label: string; color: string }> = [
   { value: 'draft', label: '草稿', color: 'grey' },
@@ -39,6 +52,35 @@ const diffLines = computed<DiffLine[]>(() => {
   const after = selectedVersionB.value?.draft.narration || ''
   return buildDiff(before, after)
 })
+
+const rehearsalRows = computed<RehearsalRow[]>(() => {
+  let cumulative = 0
+  return (draft.value?.segments || []).map((segment, index) => {
+    const actual = segment.rehearsalCurrent?.seconds ?? null
+    if (actual != null) cumulative += actual
+    const planned = segment.plannedSeconds
+    return {
+      segment,
+      index,
+      planned,
+      actual,
+      diff: actual != null && planned != null ? actual - planned : null,
+      cumulative: cumulative > 0 ? cumulative : null,
+      status: actual != null ? 'measured' : segment.rehearsalHistory.length ? 'stale' : 'pending'
+    }
+  })
+})
+const targetSeconds = computed(() => Math.round((draft.value?.durationMinutes || 0) * 60))
+const rehearsalLimitSeconds = computed(() => Math.round(targetSeconds.value * REHEARSAL_LIMIT))
+const totalPlannedSeconds = computed(() => rehearsalRows.value.reduce((sum, row) => sum + (row.planned || 0), 0))
+const totalActualSeconds = computed(() => rehearsalRows.value.reduce((sum, row) => sum + (row.actual || 0), 0))
+const measuredCount = computed(() => rehearsalRows.value.filter(row => row.status === 'measured').length)
+const staleCount = computed(() => rehearsalRows.value.filter(row => row.status === 'stale').length)
+const actualPercent = computed(() => targetSeconds.value > 0 ? Math.round(totalActualSeconds.value / targetSeconds.value * 100) : 0)
+const overLimitRow = computed(() => targetSeconds.value > 0
+  ? rehearsalRows.value.find(row => row.cumulative != null && row.cumulative > rehearsalLimitSeconds.value)
+  : undefined)
+const slowRows = computed(() => rehearsalRows.value.filter(row => row.diff != null && row.diff > 0))
 
 onMounted(() => {
   store.hydrate()
@@ -74,6 +116,32 @@ function saveDraftField(field: 'title' | 'narration' | 'accessibility' | 'durati
 }
 function saveSegment(id: string, field: 'label' | 'content', event: Event) {
   store.updateSegment(id, { [field]: (event.target as HTMLInputElement | HTMLTextAreaElement).value })
+}
+function savePlanned(id: string, event: Event) {
+  const raw = (event.target as HTMLInputElement).value.trim()
+  store.setPlannedSeconds(id, raw === '' ? null : Number(raw))
+}
+function saveActual(id: string, event: Event) {
+  const raw = (event.target as HTMLInputElement).value.trim()
+  if (raw === '') return
+  store.recordRehearsal(id, Number(raw))
+}
+function toggleHistory(id: string) {
+  expandedHistory.value = expandedHistory.value.includes(id)
+    ? expandedHistory.value.filter(item => item !== id)
+    : [...expandedHistory.value, id]
+}
+function formatSeconds(value: number | null) {
+  if (value == null) return '—'
+  const minutes = Math.floor(value / 60)
+  const seconds = value % 60
+  return minutes ? `${minutes} 分 ${seconds ? `${seconds} 秒` : ''}`.trim() : `${seconds} 秒`
+}
+function rehearsalStatusMeta(status: RehearsalRow['status']) {
+  return ({ measured: { label: '已测', color: 'success' }, stale: { label: '待重测', color: 'warning' }, pending: { label: '待测', color: 'grey' } })[status]
+}
+function rehearsalEndLabel(entry: RehearsalEntry) {
+  return entry.endReason === 'edit' ? '改稿后失效' : '重测后替换'
 }
 function submitVersion() {
   store.createVersion(versionName.value.trim() || undefined)
@@ -195,6 +263,7 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
 
         <v-tabs v-model="activeTab" color="primary" bg-color="surface" rounded="lg" class="mb-4 px-2">
           <v-tab value="editor">脚本编辑</v-tab>
+          <v-tab value="rehearsal">播读排演</v-tab>
           <v-tab value="versions">版本比较</v-tab>
           <v-tab value="preview">设备预览</v-tab>
           <v-tab value="sources">资料核对</v-tab>
@@ -296,6 +365,169 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                   </v-card>
                 </v-col>
               </v-row>
+            </v-window-item>
+
+            <v-window-item value="rehearsal">
+              <v-card class="script-card pa-4 pa-md-6 mb-5">
+                <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-4">
+                  <div>
+                    <div class="section-title">播读排演</div>
+                    <div class="text-body-2 text-medium-emphasis mt-1">逐段记录计划与实测秒数，实测按段落顺序累计；累计超过目标一成时定位超限段落。</div>
+                  </div>
+                  <v-chip variant="tonal">{{ measuredCount }}/{{ rehearsalRows.length }} 段已实测</v-chip>
+                </div>
+                <div class="d-flex flex-wrap align-end ga-6">
+                  <div style="min-width:180px">
+                    <v-text-field label="目标时长（分钟）" type="number" min="0" step="0.5" density="compact" hide-details :model-value="draft.durationMinutes" @change="saveDraftField('durationMinutes', $event)" />
+                  </div>
+                  <div>
+                    <div class="text-caption text-medium-emphasis">目标</div>
+                    <div class="text-h6">{{ targetSeconds > 0 ? formatSeconds(targetSeconds) : '未设置' }}</div>
+                  </div>
+                  <div>
+                    <div class="text-caption text-medium-emphasis">计划合计</div>
+                    <div class="text-h6">{{ formatSeconds(totalPlannedSeconds) }}</div>
+                  </div>
+                  <div>
+                    <div class="text-caption text-medium-emphasis">实测累计</div>
+                    <div class="text-h6">{{ formatSeconds(totalActualSeconds) }}</div>
+                  </div>
+                  <div class="flex-grow-1" style="min-width:220px">
+                    <div class="text-caption text-medium-emphasis mb-1">
+                      实测占目标 {{ actualPercent }}%<template v-if="targetSeconds > 0">（超限线 {{ formatSeconds(rehearsalLimitSeconds) }}）</template>
+                    </div>
+                    <v-progress-linear
+                      :model-value="targetSeconds > 0 ? Math.min(100, totalActualSeconds / rehearsalLimitSeconds * 100) : 0"
+                      :color="overLimitRow ? 'error' : totalActualSeconds > targetSeconds ? 'warning' : 'primary'"
+                      height="8"
+                      rounded
+                    />
+                  </div>
+                </div>
+                <v-alert v-if="targetSeconds <= 0" class="mt-4" type="info" variant="tonal" density="compact">
+                  尚未设置目标时长，请在上方或「脚本编辑」页填写预计朗读时长，排演超限提醒才能生效。
+                </v-alert>
+                <v-alert v-else-if="overLimitRow" class="mt-4" type="error" variant="tonal">
+                  <div class="font-weight-medium">实测累计 {{ formatSeconds(totalActualSeconds) }}，已超目标一成（超限线 {{ formatSeconds(rehearsalLimitSeconds) }}）。</div>
+                  <div>超限起点：第 {{ overLimitRow.index + 1 }} 段「{{ segmentLabel(overLimitRow.segment) }}」，录到该段时累计 {{ formatSeconds(overLimitRow.cumulative) }}，请优先压缩该段及之前读慢的段落。</div>
+                  <div v-if="slowRows.length">读慢段落：{{ slowRows.map(row => `第 ${row.index + 1} 段「${segmentLabel(row.segment)}」+${row.diff} 秒`).join('、') }}。</div>
+                </v-alert>
+                <v-alert v-else-if="totalActualSeconds > targetSeconds" class="mt-4" type="warning" variant="tonal" density="compact">
+                  实测累计 {{ formatSeconds(totalActualSeconds) }} 已超过目标 {{ formatSeconds(targetSeconds) }}，但未超出一成，请注意控制节奏。
+                </v-alert>
+                <v-alert v-if="staleCount" class="mt-4" color="warning" variant="tonal" density="compact" prepend-icon="mdi-refresh">
+                  {{ staleCount }} 个段落改稿后待重测，重新实测后才会计入累计。
+                </v-alert>
+                <v-alert v-else-if="rehearsalRows.length && measuredCount === rehearsalRows.length && !overLimitRow && totalActualSeconds <= targetSeconds" class="mt-4" type="success" variant="tonal" density="compact">
+                  全部段落已实测，累计时长在目标范围内。
+                </v-alert>
+              </v-card>
+
+              <v-card class="script-card pa-4 pa-md-6">
+                <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-4">
+                  <div>
+                    <div class="section-title">分段排演记录</div>
+                    <div class="text-body-2 text-medium-emphasis mt-1">锁定段落仅保留历史查看，不能直接改结果；改稿后该段实测自动转为待重测。</div>
+                  </div>
+                  <v-chip variant="tonal">{{ draft.segments.filter(item => item.locked).length }}/{{ draft.segments.length }} 已锁定</v-chip>
+                </div>
+                <v-table v-if="rehearsalRows.length" density="comfortable" class="rehearsal-table">
+                  <thead>
+                    <tr>
+                      <th>段落</th>
+                      <th class="rehearsal-col-seconds">计划（秒）</th>
+                      <th class="rehearsal-col-seconds">实测（秒）</th>
+                      <th>累计</th>
+                      <th>与计划差</th>
+                      <th>状态</th>
+                      <th>历史</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template v-for="row in rehearsalRows" :key="row.segment.id">
+                      <tr :class="{ 'over-limit': overLimitRow?.segment.id === row.segment.id, 'row-locked': row.segment.locked }">
+                        <td>
+                          <div class="d-flex align-center ga-2">
+                            <span class="text-caption text-medium-emphasis">{{ row.index + 1 }}.</span>
+                            <div>
+                              <div class="font-weight-medium">
+                                {{ segmentLabel(row.segment) }}
+                                <span v-if="row.segment.locked" role="img" aria-label="已锁定">🔒</span>
+                              </div>
+                              <div class="text-caption text-medium-emphasis rehearsal-preview">{{ row.segment.content || '（暂无文字）' }}</div>
+                            </div>
+                          </div>
+                        </td>
+                        <td>
+                          <div class="d-flex align-center ga-1">
+                            <v-text-field
+                              class="rehearsal-input"
+                              :model-value="row.planned ?? ''"
+                              type="number"
+                              min="1"
+                              density="compact"
+                              hide-details
+                              :disabled="row.segment.locked"
+                              :aria-label="`第 ${row.index + 1} 段计划秒数`"
+                              @change="savePlanned(row.segment.id, $event)"
+                            />
+                            <v-btn size="x-small" variant="text" :disabled="row.segment.locked" :aria-label="`按语速估算第 ${row.index + 1} 段计划秒数`" @click="store.estimatePlannedSeconds(row.segment.id)">估算</v-btn>
+                          </div>
+                        </td>
+                        <td>
+                          <v-text-field
+                            class="rehearsal-input"
+                            :model-value="row.actual ?? ''"
+                            type="number"
+                            min="1"
+                            density="compact"
+                            hide-details
+                            :disabled="row.segment.locked"
+                            :placeholder="row.status === 'stale' ? '待重测' : '秒'"
+                            :aria-label="`第 ${row.index + 1} 段实测秒数`"
+                            @change="saveActual(row.segment.id, $event)"
+                          />
+                        </td>
+                        <td>{{ row.cumulative != null ? formatSeconds(row.cumulative) : '—' }}</td>
+                        <td>
+                          <span v-if="row.diff != null" :class="row.diff > 0 ? 'text-error font-weight-medium' : 'text-success'">{{ row.diff > 0 ? `+${row.diff}` : row.diff }} 秒</span>
+                          <span v-else class="text-medium-emphasis">—</span>
+                        </td>
+                        <td>
+                          <v-chip size="small" variant="tonal" :color="rehearsalStatusMeta(row.status).color">{{ rehearsalStatusMeta(row.status).label }}</v-chip>
+                          <v-chip v-if="overLimitRow?.segment.id === row.segment.id" class="ms-1" size="small" color="error">超限点</v-chip>
+                        </td>
+                        <td>
+                          <v-btn
+                            size="small"
+                            variant="text"
+                            :disabled="!row.segment.rehearsalHistory.length"
+                            :aria-expanded="expandedHistory.includes(row.segment.id)"
+                            :aria-label="`第 ${row.index + 1} 段实测历史`"
+                            @click="toggleHistory(row.segment.id)"
+                          >
+                            历史{{ row.segment.rehearsalHistory.length ? `（${row.segment.rehearsalHistory.length}）` : '' }}
+                          </v-btn>
+                        </td>
+                      </tr>
+                      <tr v-if="expandedHistory.includes(row.segment.id)" class="history-row">
+                        <td colspan="7">
+                          <div class="text-caption text-medium-emphasis mb-2">「{{ segmentLabel(row.segment) }}」实测记录（只读，不可直接修改）</div>
+                          <div v-if="row.segment.rehearsalCurrent" class="history-entry">
+                            <v-chip size="x-small" color="success" variant="tonal">当前有效</v-chip>
+                            <span class="ms-2">{{ row.segment.rehearsalCurrent.seconds }} 秒 · {{ formatTime(row.segment.rehearsalCurrent.createdAt) }} 记录</span>
+                          </div>
+                          <div v-for="entry in row.segment.rehearsalHistory" :key="entry.id" class="history-entry">
+                            <v-chip size="x-small" :color="entry.endReason === 'edit' ? 'warning' : 'grey'" variant="tonal">{{ rehearsalEndLabel(entry) }}</v-chip>
+                            <span class="ms-2">{{ entry.seconds }} 秒 · {{ formatTime(entry.createdAt) }} 记录<template v-if="entry.endedAt"> · {{ formatTime(entry.endedAt) }} 失效</template></span>
+                          </div>
+                        </td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </v-table>
+                <div v-else class="text-medium-emphasis pa-4">请先在「脚本编辑」页添加段落，再回来记录排演。</div>
+              </v-card>
             </v-window-item>
 
             <v-window-item value="versions">

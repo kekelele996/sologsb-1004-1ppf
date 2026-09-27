@@ -13,8 +13,23 @@ const segments = (prefix: string, values: Array<[string, string, boolean?]>): Se
   id: `${prefix}-${index + 1}`,
   label,
   content,
-  locked: Boolean(locked)
+  locked: Boolean(locked),
+  plannedSeconds: null,
+  rehearsalCurrent: null,
+  rehearsalHistory: []
 }))
+
+function normalizeSegment(segment: Partial<Segment>): Segment {
+  return {
+    id: segment.id || `segment-${Date.now()}`,
+    label: segment.label || '',
+    content: segment.content || '',
+    locked: Boolean(segment.locked),
+    plannedSeconds: typeof segment.plannedSeconds === 'number' && Number.isFinite(segment.plannedSeconds) ? segment.plannedSeconds : null,
+    rehearsalCurrent: segment.rehearsalCurrent && typeof segment.rehearsalCurrent.seconds === 'number' ? segment.rehearsalCurrent : null,
+    rehearsalHistory: Array.isArray(segment.rehearsalHistory) ? segment.rehearsalHistory : []
+  }
+}
 
 function demoState(): PersistedState {
   const halls: Hall[] = [
@@ -22,6 +37,20 @@ function demoState(): PersistedState {
     { id: 'hall-silk', name: '丝路交融厅', description: '丝绸之路上的器物、信仰与生活' },
     { id: 'hall-city', name: '城市记忆厅', description: '近现代城市空间与市民生活' }
   ]
+  const jadeZhSegments = segments('jade-zh', [
+    ['开场定位', '这件玉琮来自距今约五千年的良渚文化。', true],
+    ['器物观察', '它外方内圆，四角雕刻神人兽面纹。', true],
+    ['文化含义', '玉琮常被看作沟通天地的礼器，也象征权力与身份。'],
+    ['参观提示', '请沿展柜顺时针观察，触摸复制品前先使用免洗消毒液。']
+  ])
+  jadeZhSegments[0].plannedSeconds = 12
+  jadeZhSegments[0].rehearsalCurrent = { id: 'rehearsal-jade-zh-1', seconds: 13, createdAt: '2026-09-26T01:10:00.000Z' }
+  jadeZhSegments[1].plannedSeconds = 15
+  jadeZhSegments[1].rehearsalCurrent = { id: 'rehearsal-jade-zh-2', seconds: 18, createdAt: '2026-09-26T01:12:00.000Z' }
+  jadeZhSegments[1].rehearsalHistory = [{ id: 'rehearsal-jade-zh-2a', seconds: 16, createdAt: '2026-09-25T09:30:00.000Z', endedAt: '2026-09-26T01:12:00.000Z', endReason: 'remeasure' }]
+  jadeZhSegments[2].plannedSeconds = 20
+  jadeZhSegments[2].rehearsalHistory = [{ id: 'rehearsal-jade-zh-3a', seconds: 27, createdAt: '2026-09-25T09:33:00.000Z', endedAt: '2026-09-26T02:05:00.000Z', endReason: 'edit' }]
+  jadeZhSegments[3].plannedSeconds = 18
   const exhibits: Exhibit[] = [
     {
       id: 'exhibit-jade', hallId: 'hall-ancient', code: 'A-03', title: '玉琮：沟通天地的礼器', order: 3,
@@ -32,12 +61,7 @@ function demoState(): PersistedState {
           accessibility: '玉琮为深青色，高约二十厘米。触摸模型可感受方形四角与中央圆孔；圆孔贯穿器身。',
           durationMinutes: 2.5, sources: '《中国玉器全集》第一卷；本馆藏品档案 1987-J-042',
           status: 'approved', updatedAt: '2026-09-23T08:35:00.000Z',
-          segments: segments('jade-zh', [
-            ['开场定位', '这件玉琮来自距今约五千年的良渚文化。', true],
-            ['器物观察', '它外方内圆，四角雕刻神人兽面纹。', true],
-            ['文化含义', '玉琮常被看作沟通天地的礼器，也象征权力与身份。'],
-            ['参观提示', '请沿展柜顺时针观察，触摸复制品前先使用免洗消毒液。']
-          ])
+          segments: jadeZhSegments
         },
         {
           id: 'draft-jade-en', languageId: 'en', title: 'Jade Cong: A Ritual Object Between Heaven and Earth',
@@ -162,8 +186,14 @@ export const useScriptStore = defineStore('museum-script', {
       } else {
         this.resetDemo()
       }
+      this.normalizeRehearsals()
       this.ensureSelection()
       this.hydrated = true
+    },
+    normalizeRehearsals() {
+      this.exhibits.forEach(exhibit => exhibit.drafts.forEach((draft) => {
+        draft.segments = (draft.segments || []).map(normalizeSegment)
+      }))
     },
     resetDemo() {
       this.$patch({ ...demoState(), hydrated: true, past: [], future: [] })
@@ -222,7 +252,52 @@ export const useScriptStore = defineStore('museum-script', {
     updateSegment(id: string, patch: Partial<Pick<Segment, 'label' | 'content'>>) {
       const segment = this.selectedDraft?.segments.find(item => item.id === id)
       if (!segment || segment.locked) return
-      this.commit(() => Object.assign(segment, patch))
+      const contentChanged = patch.content !== undefined && patch.content !== segment.content
+      const hadMeasurement = Boolean(segment.rehearsalCurrent)
+      this.commit(() => {
+        Object.assign(segment, patch)
+        if (contentChanged && segment.rehearsalCurrent) {
+          const now = new Date().toISOString()
+          segment.rehearsalHistory.unshift({ ...segment.rehearsalCurrent, endedAt: now, endReason: 'edit' })
+          segment.rehearsalCurrent = null
+        }
+      })
+      if (contentChanged && hadMeasurement) this.notice = '段落文字已修改，原实测转为待重测。'
+    },
+    setPlannedSeconds(id: string, value: number | null) {
+      const segment = this.selectedDraft?.segments.find(item => item.id === id)
+      if (!segment || segment.locked) return
+      const seconds = value != null && Number.isFinite(value) && value > 0 ? Math.round(value) : null
+      if (segment.plannedSeconds === seconds) return
+      this.commit(() => { segment.plannedSeconds = seconds })
+    },
+    estimatePlannedSeconds(id: string) {
+      const segment = this.selectedDraft?.segments.find(item => item.id === id)
+      if (!segment || segment.locked) return
+      const length = segment.content.replace(/\s/g, '').length
+      if (!length) {
+        this.notice = '段落暂无文字，无法估算。'
+        return
+      }
+      const seconds = Math.max(1, Math.round(length / 220 * 60))
+      this.commit(() => { segment.plannedSeconds = seconds })
+      this.notice = `已按 220 字/分钟估算「${segment.label || '未命名段落'}」计划 ${seconds} 秒。`
+    },
+    recordRehearsal(id: string, value: number) {
+      const segment = this.selectedDraft?.segments.find(item => item.id === id)
+      if (!segment || segment.locked) return
+      if (!Number.isFinite(value) || value <= 0) {
+        this.notice = '实测秒数需为大于 0 的数字。'
+        return
+      }
+      const seconds = Math.round(value)
+      if (segment.rehearsalCurrent?.seconds === seconds) return
+      this.commit(() => {
+        const now = new Date().toISOString()
+        if (segment.rehearsalCurrent) segment.rehearsalHistory.unshift({ ...segment.rehearsalCurrent, endedAt: now, endReason: 'remeasure' })
+        segment.rehearsalCurrent = { id: `rehearsal-${Date.now()}`, seconds, createdAt: now }
+      })
+      this.notice = `已记录「${segment.label || '未命名段落'}」实测 ${seconds} 秒。`
     },
     toggleLock(id: string) {
       const segment = this.selectedDraft?.segments.find(item => item.id === id)
@@ -233,7 +308,7 @@ export const useScriptStore = defineStore('museum-script', {
     addSegment() {
       const draft = this.selectedDraft
       if (!draft) return
-      this.commit(() => draft.segments.push({ id: `segment-${Date.now()}`, label: `新段落 ${draft.segments.length + 1}`, content: '', locked: false }))
+      this.commit(() => draft.segments.push({ id: `segment-${Date.now()}`, label: `新段落 ${draft.segments.length + 1}`, content: '', locked: false, plannedSeconds: null, rehearsalCurrent: null, rehearsalHistory: [] }))
     },
     removeSegment(id: string) {
       const draft = this.selectedDraft
@@ -272,6 +347,7 @@ export const useScriptStore = defineStore('museum-script', {
         if (!exhibit) return
         const index = exhibit.drafts.findIndex(item => item.languageId === version.languageId)
         const restored = JSON.parse(JSON.stringify(version.draft)) as LanguageDraft
+        restored.segments = (restored.segments || []).map(normalizeSegment)
         if (index >= 0) exhibit.drafts[index] = restored
         else exhibit.drafts.push(restored)
       })

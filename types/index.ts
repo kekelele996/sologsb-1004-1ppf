@@ -1,5 +1,6 @@
 export type ScriptStatus = 'draft' | 'review' | 'returned' | 'approved'
 export type DeviceKind = 'desktop' | 'tablet' | 'mobile' | 'kiosk'
+export type RehearsalEndReason = 'edit' | 'remeasure'
 
 export interface Hall {
   id: string
@@ -7,11 +8,22 @@ export interface Hall {
   description: string
 }
 
+export interface RehearsalEntry {
+  id: string
+  seconds: number
+  createdAt: string
+  endedAt?: string
+  endReason?: RehearsalEndReason
+}
+
 export interface Segment {
   id: string
   label: string
   content: string
   locked: boolean
+  plannedSeconds: number | null
+  rehearsalCurrent: RehearsalEntry | null
+  rehearsalHistory: RehearsalEntry[]
 }
 
 export interface LanguageDraft {

@@ -21,5 +21,13 @@ body { margin: 0; background: #f4f0e8; }
 .diff-add { background: #e7f5eb; color: #1f6338; }
 .diff-remove { background: #fdebea; color: #9b2c25; text-decoration: line-through; }
 .status-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+.rehearsal-table th { white-space: nowrap; }
+.rehearsal-col-seconds { width: 168px; }
+.rehearsal-input { max-width: 96px; }
+.rehearsal-preview { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rehearsal-table tr.over-limit td { background: #fdebea; }
+.rehearsal-table tr.row-locked td { color: #5d564e; }
+.rehearsal-table tr.history-row td { background: #faf7f0; }
+.history-entry { padding: 4px 0; }
 :focus-visible { outline: 3px solid #d18b21 !important; outline-offset: 2px; }
 @media (max-width: 900px) { .desktop-only { display: none !important; } }
