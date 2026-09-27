@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import type { Exhibit, Hall, Language, LanguageDraft, PersistedState, ScriptStatus, Segment, VersionSnapshot } from '~/types'
+import type { Exhibit, Hall, Language, LanguageDraft, PersistedState, RehearsalSession, ScriptStatus, Segment, SegmentRehearsal, VersionSnapshot } from '~/types'
 
 export const LANGUAGES: Language[] = [
   { id: 'zh', code: 'zh-CN', label: '简体中文', shortLabel: '中' },
@@ -107,6 +107,7 @@ function demoState(): PersistedState {
     halls,
     exhibits,
     versions: [],
+    rehearsals: [],
     selectedHallId: halls[0].id,
     selectedExhibitId: exhibits[0].id,
     selectedLanguageId: 'zh',
@@ -119,6 +120,7 @@ export const useScriptStore = defineStore('museum-script', {
     halls: [] as Hall[],
     exhibits: [] as Exhibit[],
     versions: [] as VersionSnapshot[],
+    rehearsals: [] as RehearsalSession[],
     selectedHallId: '',
     selectedExhibitId: '',
     selectedLanguageId: 'zh',
@@ -144,6 +146,9 @@ export const useScriptStore = defineStore('museum-script', {
     wordCount(): number {
       return (this.selectedDraft?.narration || '').replace(/\s/g, '').length
     },
+    currentRehearsal(state): RehearsalSession | undefined {
+      return state.rehearsals.find(item => item.exhibitId === state.selectedExhibitId && item.languageId === state.selectedLanguageId)
+    },
     canUndo(state): boolean { return state.past.length > 0 },
     canRedo(state): boolean { return state.future.length > 0 }
   },
@@ -155,6 +160,7 @@ export const useScriptStore = defineStore('museum-script', {
         try {
           const data = JSON.parse(saved) as PersistedState
           this.$patch({ ...data, hydrated: true })
+          if (!Array.isArray(this.rehearsals)) this.rehearsals = []
           if (!this.halls.length || !this.exhibits.length) this.resetDemo()
         } catch {
           this.resetDemo()
@@ -185,6 +191,7 @@ export const useScriptStore = defineStore('museum-script', {
       if (typeof localStorage === 'undefined') return
       const data: PersistedState = {
         halls: this.halls, exhibits: this.exhibits, versions: this.versions,
+        rehearsals: this.rehearsals,
         selectedHallId: this.selectedHallId, selectedExhibitId: this.selectedExhibitId,
         selectedLanguageId: this.selectedLanguageId, lastSavedAt: this.lastSavedAt
       }
@@ -222,7 +229,9 @@ export const useScriptStore = defineStore('museum-script', {
     updateSegment(id: string, patch: Partial<Pick<Segment, 'label' | 'content'>>) {
       const segment = this.selectedDraft?.segments.find(item => item.id === id)
       if (!segment || segment.locked) return
+      const contentChanged = patch.content !== undefined && patch.content !== segment.content
       this.commit(() => Object.assign(segment, patch))
+      if (contentChanged) this.markRehearsalStale(id)
     },
     toggleLock(id: string) {
       const segment = this.selectedDraft?.segments.find(item => item.id === id)
@@ -246,6 +255,104 @@ export const useScriptStore = defineStore('museum-script', {
       if (!draft) return
       this.commit(() => { draft.status = status; draft.updatedAt = new Date().toISOString() })
       this.notice = `状态已更新为“${this.statusLabel(status)}”。`
+    },
+    ensureRehearsal(): RehearsalSession | undefined {
+      const exhibit = this.selectedExhibit
+      const draft = this.selectedDraft
+      if (!exhibit || !draft) return undefined
+      let session = this.currentRehearsal
+      if (!session) {
+        session = {
+          exhibitId: exhibit.id,
+          languageId: draft.languageId,
+          targetSeconds: Math.max(1, Math.round(draft.durationMinutes * 60)),
+          segments: [],
+          updatedAt: new Date().toISOString()
+        }
+        this.rehearsals.push(session)
+        this.persist()
+      }
+      return session
+    },
+    mutateRehearsal(mutator: (session: RehearsalSession) => void) {
+      const session = this.ensureRehearsal()
+      if (!session) return
+      mutator(session)
+      session.updatedAt = new Date().toISOString()
+      this.persist()
+    },
+    segmentRehearsal(session: RehearsalSession, segmentId: string): SegmentRehearsal {
+      let entry = session.segments.find(item => item.segmentId === segmentId)
+      if (!entry) {
+        entry = { segmentId, plannedSeconds: null, records: [] }
+        session.segments.push(entry)
+      }
+      return entry
+    },
+    setRehearsalTarget(seconds: number) {
+      if (!Number.isFinite(seconds) || seconds <= 0) return
+      this.mutateRehearsal(session => { session.targetSeconds = Math.round(seconds) })
+      this.notice = '排演目标时长已更新。'
+    },
+    resetRehearsalTarget() {
+      const draft = this.selectedDraft
+      if (!draft) return
+      this.mutateRehearsal(session => { session.targetSeconds = Math.max(1, Math.round(draft.durationMinutes * 60)) })
+      this.notice = '已按预计朗读时长重置排演目标。'
+    },
+    setPlannedSeconds(segmentId: string, seconds: number | null) {
+      if (seconds !== null && (!Number.isFinite(seconds) || seconds < 0)) return
+      this.mutateRehearsal(session => {
+        this.segmentRehearsal(session, segmentId).plannedSeconds = seconds === null ? null : Math.round(seconds)
+      })
+    },
+    estimatePlannedSeconds() {
+      const draft = this.selectedDraft
+      if (!draft) return
+      let filled = 0
+      this.mutateRehearsal(session => {
+        for (const segment of draft.segments) {
+          const entry = this.segmentRehearsal(session, segment.id)
+          if (entry.plannedSeconds === null) {
+            entry.plannedSeconds = Math.max(1, Math.round(segment.content.replace(/\s/g, '').length / 220 * 60))
+            filled += 1
+          }
+        }
+      })
+      this.notice = filled ? `已按 220 字/分钟为 ${filled} 个段落估算计划秒数。` : '各段计划秒数已填写，未做改动。'
+    },
+    recordActual(segmentId: string, seconds: number) {
+      const draft = this.selectedDraft
+      const segment = draft?.segments.find(item => item.id === segmentId)
+      if (!draft || !segment) return
+      if (segment.locked) {
+        this.notice = '段落已锁定，历史记录保留，但不能直接改结果；请先解锁再录入。'
+        return
+      }
+      if (!Number.isFinite(seconds) || seconds <= 0) {
+        this.notice = '请填入大于 0 的实测秒数。'
+        return
+      }
+      const value = Math.round(seconds)
+      this.mutateRehearsal(session => {
+        this.segmentRehearsal(session, segmentId).records.unshift({
+          id: `record-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          seconds: value,
+          recordedAt: new Date().toISOString(),
+          stale: false
+        })
+      })
+      const index = draft.segments.findIndex(item => item.id === segmentId)
+      this.notice = `已记录第 ${index + 1} 段「${segment.label || '未命名段落'}」实测 ${value} 秒。`
+    },
+    markRehearsalStale(segmentId: string) {
+      const session = this.currentRehearsal
+      const entry = session?.segments.find(item => item.segmentId === segmentId)
+      if (!session || !entry || !entry.records.some(record => !record.stale)) return
+      entry.records.forEach(record => { record.stale = true })
+      session.updatedAt = new Date().toISOString()
+      this.persist()
+      this.notice = '该段文字已修改，原实测转为待重测。'
     },
     statusLabel(status: ScriptStatus) {
       return ({ draft: '草稿', review: '待审', returned: '退回', approved: '已定稿' })[status]

@@ -52,10 +52,32 @@ export interface VersionSnapshot {
   draft: LanguageDraft
 }
 
+export interface RehearsalRecord {
+  id: string
+  seconds: number
+  recordedAt: string
+  stale: boolean
+}
+
+export interface SegmentRehearsal {
+  segmentId: string
+  plannedSeconds: number | null
+  records: RehearsalRecord[]
+}
+
+export interface RehearsalSession {
+  exhibitId: string
+  languageId: string
+  targetSeconds: number
+  segments: SegmentRehearsal[]
+  updatedAt: string
+}
+
 export interface PersistedState {
   halls: Hall[]
   exhibits: Exhibit[]
   versions: VersionSnapshot[]
+  rehearsals: RehearsalSession[]
   selectedHallId: string
   selectedExhibitId: string
   selectedLanguageId: string
